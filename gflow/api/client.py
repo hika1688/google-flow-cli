@@ -121,8 +121,21 @@ class FlowClient:
             self._refresh_token()
 
     def _refresh_token(self) -> None:
-        """Get a fresh access token from the session endpoint."""
-        data = refresh_access_token(self.cookies, debug=self.debug)
+        """Get a fresh access token from the session endpoint.
+
+        If the saved cookies are expired, automatically re-authenticates
+        via browser login and retries.
+        """
+        try:
+            data = refresh_access_token(self.cookies, debug=self.debug)
+        except AuthError:
+            # Cookies expired — try to re-authenticate automatically
+            logger.info("Cookies expired — re-authenticating...")
+            new_cookies = self._re_authenticate()
+            if not new_cookies:
+                raise
+            data = refresh_access_token(self.cookies, debug=self.debug)
+
         self._access_token = data["access_token"]
 
         # Update sandbox session (Bearer only, no cookies)
@@ -143,6 +156,19 @@ class FlowClient:
 
         if self.debug:
             logger.info("Token refreshed: %s...", self._access_token[:20])
+
+    def _re_authenticate(self) -> str | None:
+        """Re-authenticate via browser and update cookies in-place."""
+        try:
+            from gflow.auth import BrowserAuth, save_env
+            browser_auth = BrowserAuth(debug=self.debug)
+            auth = browser_auth.get_auth(interactive=True)
+            save_env(auth)
+            self.cookies = auth.cookies
+            return self.cookies
+        except Exception as e:
+            logger.warning("Auto re-authentication failed: %s", e)
+            return None
 
     def _get_recaptcha_token(self, action: str = "IMAGE_GENERATION") -> str:
         """Get a fresh reCAPTCHA Enterprise token.
@@ -195,6 +221,13 @@ class FlowClient:
             logger.info("Creating project: %s", json.dumps(payload))
 
         resp = self._labs_session.post(url, json=payload, timeout=30)
+
+        # If cookies are stale, re-auth and retry once
+        if resp.status_code == 401:
+            logger.info("Project creation got 401 — re-authenticating...")
+            if self._re_authenticate():
+                self._refresh_token()
+                resp = self._labs_session.post(url, json=payload, timeout=30)
 
         if resp.status_code != 200:
             raise FlowAPIError(f"Failed to create project: {resp.status_code} {resp.text[:300]}")
