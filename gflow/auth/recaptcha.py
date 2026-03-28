@@ -146,8 +146,19 @@ class RecaptchaProvider:
             # Run visible (not headless or offscreen — reCAPTCHA detects
             # hidden/offscreen windows and tanks the trust score)
             "--window-size=800,600",
-            FLOW_URL,
         ]
+
+        # Route Chrome through residential proxy if configured
+        try:
+            from gflow.auth.proxy_ext import get_chrome_proxy_args
+            proxy_args = get_chrome_proxy_args()
+            if proxy_args:
+                args.extend(proxy_args)
+                logger.info("Chrome using residential proxy")
+        except Exception:
+            pass
+
+        args.append(FLOW_URL)
 
         if self.debug:
             logger.info("Auto-launching Chrome on CDP port %d", cdp_port)

@@ -92,6 +92,8 @@ def _load_proxies() -> list[str]:
     Lines starting with # are ignored. Empty lines are ignored.
 
     Returns list of proxy URLs formatted as http://user:pass@host:port
+    Proxies are NOT shuffled — the first working proxy is used for the
+    entire session (sticky IP).  Only rotates on failure.
     """
     proxy_file = Path.home() / ".gflow" / "proxies.txt"
     if not proxy_file.exists():
@@ -108,10 +110,45 @@ def _load_proxies() -> list[str]:
         proxies.append(line)
 
     if proxies:
-        random.shuffle(proxies)  # Randomize to spread load
-        logger.info("Loaded %d residential proxies", len(proxies))
+        logger.info("Loaded %d residential proxies (sticky session)", len(proxies))
 
     return proxies
+
+
+def get_active_proxy() -> str | None:
+    """Return the currently active proxy URL for external use (e.g. Chrome launch).
+
+    Returns None if no proxies are configured.
+    """
+    proxy_file = Path.home() / ".gflow" / "proxies.txt"
+    if not proxy_file.exists():
+        return None
+
+    for line in proxy_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith("http"):
+            line = f"http://{line}"
+        return line  # Return first proxy (sticky)
+
+    return None
+
+
+def parse_proxy_url(proxy_url: str) -> dict:
+    """Parse proxy URL into components for Chrome extension.
+
+    Returns dict with host, port, username, password.
+    """
+    from urllib.parse import urlparse
+    p = urlparse(proxy_url)
+    return {
+        "host": p.hostname or "",
+        "port": p.port or 8080,
+        "username": p.username or "",
+        "password": p.password or "",
+        "scheme": p.scheme or "http",
+    }
 
 
 class FlowClient:

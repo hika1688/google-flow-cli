@@ -375,6 +375,16 @@ class BrowserAuth:
         if profile:
             args.append(f"--profile-directory={profile}")
 
+        # Route Chrome through residential proxy if configured
+        try:
+            from gflow.auth.proxy_ext import get_chrome_proxy_args
+            proxy_args = get_chrome_proxy_args()
+            if proxy_args:
+                args.extend(proxy_args)
+                print("  Using residential proxy for browser")
+        except Exception:
+            pass
+
         # Start with the Flow URL
         args.append(FLOW_URL)
 
