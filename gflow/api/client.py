@@ -180,14 +180,15 @@ class FlowClient:
         self._sandbox_session = requests.Session()
         self._labs_session = requests.Session()
 
-        # Apply proxy to sandbox session only (aisandbox-pa.googleapis.com).
-        # labs.google works fine without proxy — only the generation API
-        # blocks datacenter IPs.
+        # Apply proxy to BOTH sessions when configured.
+        # Chrome auth goes through the proxy, so cookies are tied to that IP.
+        # All API calls must use the same IP to avoid auth mismatches.
         if self._proxies:
             proxy_url = self._pick_proxy()
-            self._sandbox_session.proxies = {"https": proxy_url, "http": proxy_url}
+            proxy_dict = {"https": proxy_url, "http": proxy_url}
+            self._sandbox_session.proxies = proxy_dict
+            self._labs_session.proxies = proxy_dict
             if self.debug:
-                # Mask credentials in log
                 masked = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
                 logger.info("Using residential proxy: %s", masked)
 
@@ -203,11 +204,13 @@ class FlowClient:
         return proxy
 
     def _rotate_proxy(self) -> None:
-        """Switch sandbox session to the next proxy in the list."""
+        """Switch both sessions to the next proxy in the list."""
         if not self._proxies or len(self._proxies) < 2:
             return
         proxy_url = self._pick_proxy()
-        self._sandbox_session.proxies = {"https": proxy_url, "http": proxy_url}
+        proxy_dict = {"https": proxy_url, "http": proxy_url}
+        self._sandbox_session.proxies = proxy_dict
+        self._labs_session.proxies = proxy_dict
         masked = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
         logger.info("Rotated to proxy: %s", masked)
 
@@ -355,7 +358,21 @@ class FlowClient:
         if self.debug:
             logger.info("Creating project: %s", json.dumps(payload))
 
-        resp = self._labs_session.post(url, json=payload, timeout=30)
+        # Retry with proxy rotation on connection errors
+        resp = None
+        for attempt in range(3):
+            try:
+                resp = self._labs_session.post(url, json=payload, timeout=30)
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.ProxyError,
+                    requests.exceptions.ReadTimeout) as e:
+                if attempt < 2:
+                    logger.warning("Project creation connection failed (attempt %d/3): %s",
+                                   attempt + 1, str(e)[:120])
+                    self._rotate_proxy()
+                    time.sleep(3)
+                else:
+                    raise
 
         # If cookies are stale, re-auth and retry once
         if resp.status_code == 401:

@@ -73,7 +73,17 @@ def refresh_access_token(cookies: str, debug: bool = False) -> dict:
     if debug:
         logger.info("Refreshing access token from %s", SESSION_URL)
 
-    resp = requests.get(SESSION_URL, headers=headers, timeout=30)
+    # Route through residential proxy if configured (cookies are tied to proxy IP)
+    proxies = None
+    try:
+        from gflow.api.client import get_active_proxy
+        proxy_url = get_active_proxy()
+        if proxy_url:
+            proxies = {"https": proxy_url, "http": proxy_url}
+    except Exception:
+        pass
+
+    resp = requests.get(SESSION_URL, headers=headers, timeout=30, proxies=proxies)
 
     if resp.status_code == 401:
         raise AuthError(
