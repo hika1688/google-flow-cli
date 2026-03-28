@@ -308,10 +308,9 @@ class FlowClient:
 
         # Create a new project via trpc
         url = f"{LABS_BASE}/trpc/project.createProject"
-        now = time.strftime("%b %d, %I:%M %p")
         payload = {
             "json": {
-                "projectTitle": f"gflow {now}",
+                "projectTitle": "Untitled project",
                 "toolName": TOOL_NAME,
             }
         }
