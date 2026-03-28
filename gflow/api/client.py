@@ -24,6 +24,8 @@ import logging
 import os
 import random
 import time
+import urllib.request
+import urllib.error
 import uuid
 from pathlib import Path
 from typing import Any
@@ -229,6 +231,22 @@ class FlowClient:
                 self._refresh_token()
                 resp = self._labs_session.post(url, json=payload, timeout=30)
 
+        # If still 401, try via Chrome CDP (datacenter IPs get blocked on direct HTTP)
+        if resp.status_code == 401:
+            logger.info("Direct HTTP still 401 — trying via Chrome browser (CDP)...")
+            data = self._create_project_via_cdp(payload)
+            if data:
+                json_data = data.get("result", {}).get("data", {}).get("json", {})
+                project_id = (
+                    json_data.get("result", {}).get("projectId", "")
+                    or json_data.get("projectId", "")
+                )
+                if project_id:
+                    self._project_id = project_id
+                    if self.debug:
+                        logger.info("Created project via CDP: %s", project_id)
+                    return project_id
+
         if resp.status_code != 200:
             raise FlowAPIError(f"Failed to create project: {resp.status_code} {resp.text[:300]}")
 
@@ -251,6 +269,104 @@ class FlowClient:
             logger.info("Created project: %s", project_id)
 
         return project_id
+
+    def _create_project_via_cdp(self, payload: dict) -> dict | None:
+        """Create a project by running fetch() inside the Chrome browser via CDP.
+
+        This bypasses datacenter IP blocks since the request comes from
+        Chrome's browser context with full fingerprint/cookies.
+        """
+        try:
+            from gflow.auth.browser_auth import get_saved_cdp_port
+            import websocket
+
+            port = get_saved_cdp_port()
+            if not port:
+                logger.warning("No CDP port available for browser-based project creation")
+                return None
+
+            # Find a Flow tab
+            tab_url = f"http://127.0.0.1:{port}/json/list"
+            resp = urllib.request.urlopen(tab_url, timeout=5)
+            targets = json.loads(resp.read().decode())
+
+            ws_url = None
+            for target in targets:
+                if target.get("type") == "page":
+                    page_url = target.get("url", "")
+                    if "labs.google" in page_url:
+                        ws_url = target.get("webSocketDebuggerUrl", "")
+                        break
+
+            if not ws_url:
+                # Use any page tab
+                for target in targets:
+                    if target.get("type") == "page":
+                        ws_url = target.get("webSocketDebuggerUrl", "")
+                        break
+
+            if not ws_url:
+                logger.warning("No usable Chrome tab found for CDP project creation")
+                return None
+
+            ws = websocket.create_connection(ws_url, timeout=30)
+
+            # Execute fetch() inside Chrome
+            payload_json = json.dumps(payload).replace("'", "\\'").replace('"', '\\"')
+            js_code = f"""
+                fetch('https://labs.google/fx/api/trpc/project.createProject', {{
+                    method: 'POST',
+                    headers: {{
+                        'Content-Type': 'application/json',
+                        'Origin': 'https://labs.google',
+                        'Referer': 'https://labs.google/fx/tools/flow'
+                    }},
+                    credentials: 'include',
+                    body: "{payload_json}"
+                }})
+                .then(r => r.json())
+                .then(data => JSON.stringify(data))
+                .catch(e => JSON.stringify({{error: e.message}}))
+            """
+
+            msg_id = 1
+            ws.send(json.dumps({
+                "id": msg_id,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": js_code,
+                    "awaitPromise": True,
+                    "returnByValue": True,
+                }
+            }))
+
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                try:
+                    ws.settimeout(5)
+                    raw = ws.recv()
+                    data = json.loads(raw)
+                    if data.get("id") == msg_id:
+                        result = data.get("result", {}).get("result", {})
+                        value = result.get("value", "")
+                        ws.close()
+                        if value and isinstance(value, str):
+                            parsed = json.loads(value)
+                            if "error" in parsed and isinstance(parsed["error"], str):
+                                logger.warning("CDP fetch error: %s", parsed["error"])
+                                return None
+                            logger.info("Project created via Chrome CDP successfully")
+                            return parsed
+                        return None
+                except Exception:
+                    continue
+
+            ws.close()
+            return None
+
+        except Exception as e:
+            logger.warning("CDP project creation failed: %s", e)
+            return None
 
     def _ensure_workflow(self) -> str:
         """Ensure we have a workflow ID for the current project.
