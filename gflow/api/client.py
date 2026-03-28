@@ -85,6 +85,35 @@ EXTEND_MODEL_MAP = {
 }
 
 
+def _load_proxies() -> list[str]:
+    """Load residential proxy list from ~/.gflow/proxies.txt.
+
+    File format: one proxy per line as user:pass@host:port
+    Lines starting with # are ignored. Empty lines are ignored.
+
+    Returns list of proxy URLs formatted as http://user:pass@host:port
+    """
+    proxy_file = Path.home() / ".gflow" / "proxies.txt"
+    if not proxy_file.exists():
+        return []
+
+    proxies = []
+    for line in proxy_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Normalize to full URL
+        if not line.startswith("http"):
+            line = f"http://{line}"
+        proxies.append(line)
+
+    if proxies:
+        random.shuffle(proxies)  # Randomize to spread load
+        logger.info("Loaded %d residential proxies", len(proxies))
+
+    return proxies
+
+
 class FlowClient:
     """
     Client for Google Flow's internal APIs.
@@ -106,12 +135,44 @@ class FlowClient:
         # Maps operation names to media names (they differ!)
         self._op_to_media: dict[str, str] = {}
 
+        # Load residential proxy list from ~/.gflow/env
+        self._proxies = _load_proxies()
+        self._proxy_index = 0
+
         # Separate sessions for different hosts
         self._sandbox_session = requests.Session()
         self._labs_session = requests.Session()
 
+        # Apply proxy if available
+        if self._proxies:
+            proxy_url = self._pick_proxy()
+            self._sandbox_session.proxies = {"https": proxy_url, "http": proxy_url}
+            self._labs_session.proxies = {"https": proxy_url, "http": proxy_url}
+            if self.debug:
+                # Mask credentials in log
+                masked = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
+                logger.info("Using residential proxy: %s", masked)
+
         # reCAPTCHA Enterprise token provider (lazy-initialized)
         self._recaptcha: RecaptchaProvider | None = None
+
+    def _pick_proxy(self) -> str:
+        """Pick a proxy from the list (round-robin)."""
+        if not self._proxies:
+            return ""
+        proxy = self._proxies[self._proxy_index % len(self._proxies)]
+        self._proxy_index += 1
+        return proxy
+
+    def _rotate_proxy(self) -> None:
+        """Switch both sessions to the next proxy in the list."""
+        if not self._proxies or len(self._proxies) < 2:
+            return
+        proxy_url = self._pick_proxy()
+        self._sandbox_session.proxies = {"https": proxy_url, "http": proxy_url}
+        self._labs_session.proxies = {"https": proxy_url, "http": proxy_url}
+        masked = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
+        logger.info("Rotated to proxy: %s", masked)
 
     # ------------------------------------------------------------------
     # Token & Project Management
@@ -1013,10 +1074,12 @@ class FlowClient:
             try:
                 resp = self._sandbox_session.request(method, url, **kwargs)
                 break
-            except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+            except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.ProxyError) as e:
                 if attempt < max_retries - 1:
                     wait = 5 * (attempt + 1)
                     logger.warning("Connection error on %s %s (attempt %d/%d), retrying in %ds: %s", method, url, attempt + 1, max_retries, wait, e)
+                    self._rotate_proxy()  # Try next proxy on connection failure
                     _time.sleep(wait)
                 else:
                     raise
@@ -1025,6 +1088,9 @@ class FlowClient:
             if self.debug:
                 logger.info("Got 401, refreshing token...")
             self._refresh_token()
+            # Also try rotating proxy on 401 — datacenter IPs get blocked
+            if self._proxies:
+                self._rotate_proxy()
             resp = self._sandbox_session.request(method, url, **kwargs)
 
         if resp.status_code == 401:
