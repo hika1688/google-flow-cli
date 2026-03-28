@@ -1,6 +1,6 @@
 """Google Flow API client."""
 
-from .client import FlowClient, FlowAPIError
+from .client import FlowClient, FlowAPIError, FlowRecaptchaError
 from .models import (
     Asset,
     AssetType,
@@ -11,6 +11,7 @@ from .models import (
 __all__ = [
     "FlowClient",
     "FlowAPIError",
+    "FlowRecaptchaError",
     "Asset",
     "AssetType",
     "GenerateImageRequest",

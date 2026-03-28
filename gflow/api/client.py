@@ -202,6 +202,42 @@ class FlowClient:
             "sessionId": self._session_id,
         }
 
+    def _with_recaptcha_retry(self, fn, max_retries: int = 3):
+        """Wrap a generation call with reCAPTCHA retry on 403.
+
+        Args:
+            fn: A callable that takes no args and performs the generation request.
+                It will be called repeatedly with fresh reCAPTCHA tokens on failure.
+            max_retries: Maximum number of retry attempts.
+
+        Returns:
+            Whatever fn() returns on success.
+        """
+        import time as _time
+
+        for attempt in range(max_retries):
+            try:
+                return fn()
+            except FlowRecaptchaError as e:
+                if attempt < max_retries - 1:
+                    wait = 5 * (attempt + 1)
+                    logger.warning(
+                        "reCAPTCHA failed (attempt %d/%d), retrying in %ds with fresh token...",
+                        attempt + 1, max_retries, wait
+                    )
+                    # Force reconnect to get a fresh reCAPTCHA token
+                    if self._recaptcha:
+                        self._recaptcha.close()
+                        self._recaptcha = None
+                    _time.sleep(wait)
+                else:
+                    raise FlowAPIError(
+                        f"reCAPTCHA evaluation failed after {max_retries} attempts.\n"
+                        f"Last error: {e}\n"
+                        "Try: gflow auth --clear && gflow auth\n"
+                        "Then interact with the Flow page for a minute before generating."
+                    )
+
     def _ensure_project(self) -> str:
         """Create a project if we don't have one, or return existing."""
         if self._project_id:
@@ -477,52 +513,48 @@ class FlowClient:
         self._ensure_token()
         project_id = self._ensure_project()
 
-        # Get a fresh reCAPTCHA token
-        recaptcha_token = self._get_recaptcha_token()
-
         url = f"{SANDBOX_BASE}/v1/projects/{project_id}/flowMedia:batchGenerateImages"
-
         aspect = IMAGE_ASPECT_MAP.get(req.aspect_ratio.lower(), "IMAGE_ASPECT_RATIO_LANDSCAPE")
         seed = req.seed if req.seed is not None else random.randint(10000, 99999)
-        batch_id = str(uuid.uuid4())
 
-        # Build the client context with reCAPTCHA
-        client_ctx = self._build_client_context(project_id, recaptcha_token)
+        def _do_generate():
+            recaptcha_token = self._get_recaptcha_token()
+            client_ctx = self._build_client_context(project_id, recaptcha_token)
+            batch_id = str(uuid.uuid4())
 
-        # Build request payload matching exact Flow format
-        payload = {
-            "clientContext": client_ctx,
-            "mediaGenerationContext": {"batchId": batch_id},
-            "useNewMedia": True,
-            "requests": [],
-        }
-
-        # One request per image
-        for i in range(req.num_images):
-            img_req = {
+            payload = {
                 "clientContext": client_ctx,
-                "imageModelName": IMAGE_MODEL,
-                "imageAspectRatio": aspect,
-                "structuredPrompt": {
-                    "parts": [{"text": req.prompt}],
-                },
-                "seed": seed + i,
-                "imageInputs": [],
+                "mediaGenerationContext": {"batchId": batch_id},
+                "useNewMedia": True,
+                "requests": [],
             }
-            payload["requests"].append(img_req)
+            for i in range(req.num_images):
+                img_req = {
+                    "clientContext": client_ctx,
+                    "imageModelName": IMAGE_MODEL,
+                    "imageAspectRatio": aspect,
+                    "structuredPrompt": {
+                        "parts": [{"text": req.prompt}],
+                    },
+                    "seed": seed + i,
+                    "imageInputs": [],
+                }
+                payload["requests"].append(img_req)
 
-        if self.debug:
-            safe = json.dumps(payload, indent=2)[:1000]
-            logger.info("Image request to %s:\n%s", url, safe)
+            if self.debug:
+                safe = json.dumps(payload, indent=2)[:1000]
+                logger.info("Image request to %s:\n%s", url, safe)
 
-        resp = self._sandbox_request("POST", url, json_payload=payload)
-        data = resp.json()
+            resp = self._sandbox_request("POST", url, json_payload=payload)
+            data = resp.json()
 
-        if self.debug:
-            safe = json.dumps(data, indent=2)[:1000]
-            logger.info("Image response:\n%s", safe)
+            if self.debug:
+                safe = json.dumps(data, indent=2)[:1000]
+                logger.info("Image response:\n%s", safe)
 
-        return self._parse_image_response(data, req.prompt)
+            return self._parse_image_response(data, req.prompt)
+
+        return self._with_recaptcha_retry(_do_generate)
 
     # ------------------------------------------------------------------
     # Video Generation (async)
@@ -537,39 +569,41 @@ class FlowClient:
         self._ensure_token()
         project_id = self._ensure_project()
 
-        # Get a fresh reCAPTCHA token (video uses VIDEO_GENERATION action)
-        recaptcha_token = self._get_recaptcha_token(action="VIDEO_GENERATION")
-
         url = f"{SANDBOX_BASE}/v1/video:batchAsyncGenerateVideoText"
-
         aspect = VIDEO_ASPECT_MAP.get(req.aspect_ratio.lower(), "VIDEO_ASPECT_RATIO_LANDSCAPE")
         seed = req.seed if req.seed is not None else random.randint(10000, 99999)
         batch_id = str(uuid.uuid4())
 
-        client_ctx = self._build_client_context(project_id, recaptcha_token)
+        def _do_generate():
+            nonlocal batch_id
+            batch_id = str(uuid.uuid4())  # Fresh batch ID on each retry
+            recaptcha_token = self._get_recaptcha_token(action="VIDEO_GENERATION")
+            client_ctx = self._build_client_context(project_id, recaptcha_token)
 
-        payload = {
-            "mediaGenerationContext": {"batchId": batch_id},
-            "clientContext": client_ctx,
-            "requests": [{
-                "aspectRatio": aspect,
-                "seed": seed,
-                "textInput": {
-                    "structuredPrompt": {
-                        "parts": [{"text": req.prompt}],
+            payload = {
+                "mediaGenerationContext": {"batchId": batch_id},
+                "clientContext": client_ctx,
+                "requests": [{
+                    "aspectRatio": aspect,
+                    "seed": seed,
+                    "textInput": {
+                        "structuredPrompt": {
+                            "parts": [{"text": req.prompt}],
+                        },
                     },
-                },
-                "videoModelKey": VIDEO_MODEL,
-                "metadata": {},
-            }],
-            "useV2ModelConfig": True,
-        }
+                    "videoModelKey": VIDEO_MODEL,
+                    "metadata": {},
+                }],
+                "useV2ModelConfig": True,
+            }
 
-        if self.debug:
-            safe = json.dumps(payload, indent=2)[:1000]
-            logger.info("Video request to %s:\n%s", url, safe)
+            if self.debug:
+                safe = json.dumps(payload, indent=2)[:1000]
+                logger.info("Video request to %s:\n%s", url, safe)
 
-        resp = self._sandbox_request("POST", url, json_payload=payload)
+            return self._sandbox_request("POST", url, json_payload=payload)
+
+        resp = self._with_recaptcha_retry(_do_generate)
         data = resp.json()
 
         if self.debug:
@@ -625,45 +659,47 @@ class FlowClient:
         if not workflow_id:
             workflow_id = self._ensure_workflow()
 
-        # Extend uses VIDEO_GENERATION reCAPTCHA action (same as video generation)
-        recaptcha_token = self._get_recaptcha_token(action="VIDEO_GENERATION")
-
         url = f"{SANDBOX_BASE}/v1/video:batchAsyncGenerateVideoExtendVideo"
-
         aspect = VIDEO_ASPECT_MAP.get(req.aspect_ratio.lower(), "VIDEO_ASPECT_RATIO_LANDSCAPE")
         extend_model = EXTEND_MODEL_MAP.get(req.aspect_ratio.lower(), "veo_3_1_extend_fast_landscape")
         seed = req.seed if req.seed is not None else random.randint(10000, 99999)
         batch_id = str(uuid.uuid4())
 
-        client_ctx = self._build_client_context(project_id, recaptcha_token)
+        def _do_extend():
+            nonlocal batch_id
+            batch_id = str(uuid.uuid4())
+            recaptcha_token = self._get_recaptcha_token(action="VIDEO_GENERATION")
+            client_ctx = self._build_client_context(project_id, recaptcha_token)
 
-        payload = {
-            "mediaGenerationContext": {"batchId": batch_id},
-            "clientContext": client_ctx,
-            "requests": [{
-                "aspectRatio": aspect,
-                "seed": seed,
-                "textInput": {
-                    "structuredPrompt": {
-                        "parts": [{"text": req.prompt}],
+            payload = {
+                "mediaGenerationContext": {"batchId": batch_id},
+                "clientContext": client_ctx,
+                "requests": [{
+                    "aspectRatio": aspect,
+                    "seed": seed,
+                    "textInput": {
+                        "structuredPrompt": {
+                            "parts": [{"text": req.prompt}],
+                        },
                     },
-                },
-                "videoModelKey": extend_model,
-                "metadata": {
-                    "workflowId": workflow_id,
-                },
-                "videoInput": {
-                    "mediaId": req.media_id,
-                },
-            }],
-            "useV2ModelConfig": True,
-        }
+                    "videoModelKey": extend_model,
+                    "metadata": {
+                        "workflowId": workflow_id,
+                    },
+                    "videoInput": {
+                        "mediaId": req.media_id,
+                    },
+                }],
+                "useV2ModelConfig": True,
+            }
 
-        if self.debug:
-            safe = json.dumps(payload, indent=2)[:1000]
-            logger.info("Extend request to %s:\n%s", url, safe)
+            if self.debug:
+                safe = json.dumps(payload, indent=2)[:1000]
+                logger.info("Extend request to %s:\n%s", url, safe)
 
-        resp = self._sandbox_request("POST", url, json_payload=payload)
+            return self._sandbox_request("POST", url, json_payload=payload)
+
+        resp = self._with_recaptcha_retry(_do_extend)
         data = resp.json()
 
         if self.debug:
@@ -994,8 +1030,14 @@ class FlowClient:
         if resp.status_code == 401:
             raise FlowAPIError("Auth expired. Run: gflow auth --clear\nthen: gflow auth")
         if resp.status_code == 403:
+            resp_text = resp.text[:500]
+            # reCAPTCHA failures are retryable — score can vary between evaluations
+            if "recaptcha" in resp_text.lower() or "reCAPTCHA" in resp_text:
+                raise FlowRecaptchaError(
+                    f"Permission denied (403): {resp_text}"
+                )
             raise FlowAPIError(
-                f"Permission denied (403): {resp.text[:500]}"
+                f"Permission denied (403): {resp_text}"
             )
         if resp.status_code >= 400:
             raise FlowAPIError(f"API error {resp.status_code}: {resp.text[:500]}")
@@ -1187,4 +1229,9 @@ class FlowClient:
 
 class FlowAPIError(Exception):
     """Raised when a Flow API operation fails."""
+    pass
+
+
+class FlowRecaptchaError(FlowAPIError):
+    """Raised when reCAPTCHA evaluation fails (403). Retryable with a fresh token."""
     pass

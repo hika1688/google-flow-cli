@@ -109,6 +109,10 @@ class RecaptchaProvider:
 
         # Wait for reCAPTCHA to be available
         self._wait_for_recaptcha()
+
+        # Warm up reCAPTCHA to build trust score
+        self._warm_up()
+
         self._ready = True
 
         if self.debug:
@@ -139,10 +143,9 @@ class RecaptchaProvider:
             f"--user-data-dir={profile_dir}",
             "--no-first-run",
             "--no-default-browser-check",
-            # Run in background — not headless (reCAPTCHA detects that)
-            # but minimized and offscreen so user doesn't notice
+            # Run visible (not headless or offscreen — reCAPTCHA detects
+            # hidden/offscreen windows and tanks the trust score)
             "--window-size=800,600",
-            "--window-position=-32000,-32000",
             FLOW_URL,
         ]
 
@@ -308,6 +311,62 @@ class RecaptchaProvider:
             "The auth browser may have navigated away from Flow.\n"
             "Run 'gflow auth' again."
         )
+
+    def _warm_up(self) -> None:
+        """Warm up reCAPTCHA with realistic human-like browser interaction.
+
+        Uses CDP Input.dispatchMouseEvent / dispatchMouseWheel to send
+        real browser-level input events (Bezier-curved mouse movement,
+        gradual scrolling, idle fidgeting).  These register identically
+        to hardware input in reCAPTCHA's behavioral scoring model.
+
+        Then pre-executes reCAPTCHA tokens to further build trust.
+        """
+        logger.info("Warming up reCAPTCHA (building trust score)...")
+
+        # ── Phase 1: Human-like interaction via CDP Input.dispatch* ──
+        try:
+            from gflow.auth.humanizer import CDPHumanizer
+
+            humanizer = CDPHumanizer(
+                cdp_send=lambda method, params: self._cdp_send(method, params),
+            )
+            # Run full warm-up sequence: idle movement, scrolling, clicking,
+            # mouse exploration — ~12 seconds of convincing human behavior
+            humanizer.full_warmup(duration=12.0)
+        except Exception as e:
+            logger.warning("Humanizer warm-up failed (%s), falling back to basic warm-up", e)
+            # Fallback: basic JS-dispatched events (less effective but better than nothing)
+            try:
+                self._cdp_evaluate("""
+                    (function() {
+                        window.scrollTo(0, 200);
+                        window.scrollTo(0, 0);
+                        document.dispatchEvent(new MouseEvent('mousemove', {clientX: 100, clientY: 200}));
+                        document.dispatchEvent(new MouseEvent('mousemove', {clientX: 300, clientY: 400}));
+                        document.dispatchEvent(new MouseEvent('mousemove', {clientX: 500, clientY: 300}));
+                        window.dispatchEvent(new Event('focus'));
+                        return true;
+                    })()
+                """)
+            except Exception:
+                pass
+            time.sleep(2)
+
+        # ── Phase 2: Pre-execute reCAPTCHA tokens to build trust ──
+        for i in range(3):
+            try:
+                token = self._cdp_evaluate(
+                    f"grecaptcha.enterprise.execute('{RECAPTCHA_SITE_KEY}', {{action: 'WARM_UP'}})"
+                )
+                if token and isinstance(token, str) and len(token) > 100:
+                    if self.debug:
+                        logger.info("  Warm-up %d/%d OK (%d chars)", i + 1, 3, len(token))
+                time.sleep(1.5)
+            except Exception:
+                time.sleep(1)
+
+        logger.info("reCAPTCHA warm-up complete")
 
     def _execute_recaptcha(self, action: str = "IMAGE_GENERATION") -> str:
         """Execute reCAPTCHA and get a token."""
