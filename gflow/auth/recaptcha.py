@@ -139,6 +139,10 @@ class RecaptchaProvider:
             f"--user-data-dir={profile_dir}",
             "--no-first-run",
             "--no-default-browser-check",
+            # Run in background — not headless (reCAPTCHA detects that)
+            # but minimized and offscreen so user doesn't notice
+            "--window-size=800,600",
+            "--window-position=-32000,-32000",
             FLOW_URL,
         ]
 

@@ -844,6 +844,8 @@ class FlowClient:
 
     def _sandbox_request(self, method: str, url: str, json_payload: dict | None = None) -> requests.Response:
         """Make an authenticated request to aisandbox-pa.googleapis.com."""
+        import time as _time
+
         if self.debug:
             logger.info("%s %s", method, url)
 
@@ -852,7 +854,20 @@ class FlowClient:
         if json_payload is not None:
             kwargs["data"] = json.dumps(json_payload)
 
-        resp = self._sandbox_session.request(method, url, **kwargs)
+        # Retry on transient connection errors (ConnectionResetError, etc.)
+        max_retries = 3
+        resp = None
+        for attempt in range(max_retries):
+            try:
+                resp = self._sandbox_session.request(method, url, **kwargs)
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+                if attempt < max_retries - 1:
+                    wait = 5 * (attempt + 1)
+                    logger.warning("Connection error on %s %s (attempt %d/%d), retrying in %ds: %s", method, url, attempt + 1, max_retries, wait, e)
+                    _time.sleep(wait)
+                else:
+                    raise
 
         if resp.status_code == 401:
             if self.debug:

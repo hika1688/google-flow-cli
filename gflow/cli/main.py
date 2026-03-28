@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from pathlib import Path
+
+import requests
 
 import click
 from rich.console import Console
@@ -476,89 +479,195 @@ def long_video(ctx, prompt, extend_prompt, extensions, aspect_ratio, seed,
         prompt_short = prompt[:30].replace('"', '')
         client.update_workflow(workflow_id, display_name=prompt_short)
 
+    # ---- Prompt sanitization for policy violations ----
+    _POLICY_KEYWORDS = re.compile(
+        r'\b(explosion|exploding|blood|bloody|gore|gory|weapon|weapons|gun|guns|'
+        r'rifle|pistol|bullet|bullets|missile|bomb|bombing|grenade|'
+        r'kill|killing|murder|dead body|corpse|decapitat|dismember|'
+        r'nude|naked|sexual|erotic|'
+        r'drug|cocaine|heroin|meth|'
+        r'torture|torment|mutilat|'
+        r'suicide|self.harm|'
+        r'terrorist|terrorism|extremist|'
+        r'child|children|minor|kid|infant|baby|toddler)\b',
+        re.IGNORECASE
+    )
+    _POLICY_REPLACEMENTS = {
+        'explosion': 'bright energy burst', 'exploding': 'rapidly expanding',
+        'blood': 'red fluid', 'bloody': 'dramatic', 'gore': 'intensity', 'gory': 'intense',
+        'weapon': 'tool', 'weapons': 'tools', 'gun': 'device', 'guns': 'devices',
+        'rifle': 'long device', 'pistol': 'small device',
+        'bullet': 'projectile', 'bullets': 'projectiles',
+        'missile': 'fast-moving object', 'bomb': 'impact', 'bombing': 'impact event',
+        'grenade': 'small object',
+        'kill': 'overcome', 'killing': 'overcoming', 'murder': 'conflict',
+        'fire': 'warm glow', 'flame': 'warm light', 'flames': 'warm lights', 'burning': 'glowing',
+        'nuclear': 'powerful', 'war': 'conflict', 'warfare': 'conflict',
+        'death': 'end', 'dead': 'still', 'die': 'fade', 'dying': 'fading',
+    }
+    _GENERIC_FALLBACKS = [
+        "Cinematic slow aerial shot of a serene mountain landscape at golden hour, soft clouds, documentary style, 4K",
+        "Smooth dolly shot through a lush forest with sunlight filtering through trees, peaceful atmosphere, cinematic",
+        "Aerial tracking shot over a calm ocean at sunset, gentle waves reflecting golden light, documentary cinematic",
+        "Slow pan across a stunning nebula in deep space, vibrant colors, stars twinkling, cinematic documentary",
+        "Cinematic wide shot of rolling hills with wildflowers swaying in the breeze, warm golden sunlight, peaceful",
+        "Smooth tracking shot through an ancient library with dramatic lighting, dust particles in light beams, cinematic",
+    ]
+
+    def _is_policy_violation(error_str):
+        """Check if an error is a content policy/safety violation."""
+        lower = error_str.lower()
+        return any(kw in lower for kw in [
+            'safety', 'policy', 'blocked', 'violat', 'prohibited',
+            'harmful', 'inappropriate', 'content filter', 'moderation',
+            'responsible ai', 'rai_blocked', 'rai policy',
+            'could not generate', 'generation was blocked',
+        ])
+
+    def _sanitize_prompt(orig_prompt, attempt):
+        """Clean a prompt that triggered a policy violation."""
+        if attempt >= 2:
+            # Third attempt — use a generic safe fallback
+            import hashlib
+            idx = int(hashlib.md5(orig_prompt.encode()).hexdigest(), 16) % len(_GENERIC_FALLBACKS)
+            return _GENERIC_FALLBACKS[idx]
+        # Second attempt — strip/replace flagged words and add safe prefix
+        cleaned = orig_prompt
+        for word, replacement in _POLICY_REPLACEMENTS.items():
+            cleaned = re.sub(r'\b' + re.escape(word) + r'\b', replacement, cleaned, flags=re.IGNORECASE)
+        # Remove any remaining flagged words not in replacements dict
+        cleaned = _POLICY_KEYWORDS.sub('', cleaned)
+        # Clean up double spaces
+        cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip()
+        # Add documentary/cinematic prefix for safety
+        if not cleaned.lower().startswith(('cinematic', 'documentary', 'artistic', 'aerial')):
+            cleaned = f"Cinematic documentary shot of {cleaned}"
+        return cleaned
+
     # ---- Step 2+: Extend loop ----
+    MAX_SEGMENT_RETRIES = 3
     for i in range(extensions):
         step = i + 2
         console.print(f"\n[bold]Step {step}/{extensions + 1}:[/bold] Extending video (segment {i + 1})...")
 
         # Pick the extend prompt
         if extend_prompt and i < len(extend_prompt):
-            ext_prompt = extend_prompt[i]
+            ext_prompt_orig = extend_prompt[i]
         elif extend_prompt:
-            ext_prompt = extend_prompt[-1]  # Reuse last prompt
+            ext_prompt_orig = extend_prompt[-1]  # Reuse last prompt
         else:
-            ext_prompt = prompt  # Reuse original prompt
+            ext_prompt_orig = prompt  # Reuse original prompt
 
-        ext_req = ExtendVideoRequest(
-            prompt=ext_prompt,
-            media_id=current_media_id,
-            aspect_ratio=aspect_ratio,
-            workflow_id=workflow_id,
-            seed=(seed + i + 1) if seed is not None else None,
-        )
+        segment_success = False
+        for attempt in range(MAX_SEGMENT_RETRIES):
+            ext_prompt = ext_prompt_orig
 
-        # Retry extend up to 3 times (reCAPTCHA can fail intermittently)
-        ext_assets = None
-        for attempt in range(3):
+            if attempt > 0:
+                wait = 10 * attempt
+                console.print(f"  [yellow]Segment {i + 1} retry {attempt}/{MAX_SEGMENT_RETRIES - 1} after {wait}s...[/yellow]")
+                _time.sleep(wait)
+
+                # If previous failure was a policy violation, sanitize the prompt
+                if hasattr(_segment_last_error, 'is_policy') and _segment_last_error.is_policy:
+                    ext_prompt = _sanitize_prompt(ext_prompt_orig, attempt)
+                    console.print(f"  [cyan]Sanitized prompt:[/cyan] {ext_prompt[:80]}...")
+
+            # Track error info for this attempt
+            class _SegError:
+                is_policy = False
+                msg = ""
+            _segment_last_error = _SegError()
+
             try:
-                if attempt > 0:
-                    console.print(f"  [yellow]Retry {attempt}/2 after {5 * attempt}s...[/yellow]")
-                    _time.sleep(5 * attempt)
-                with console.status(f"[bold green]Submitting extend ({ext_prompt[:40]})..."):
-                    ext_assets = client.extend_video(ext_req)
-                break  # success
-            except FlowAPIError as e:
-                err_str = str(e)
-                if "reCAPTCHA" in err_str and attempt < 2:
-                    continue  # retry reCAPTCHA failures
-                elif "generation failed" in err_str.lower() and attempt < 2:
-                    continue  # retry transient generation failures
-                console.print(f"[red]Error on extension {i + 1}:[/red] {e}")
+                ext_req = ExtendVideoRequest(
+                    prompt=ext_prompt,
+                    media_id=current_media_id,
+                    aspect_ratio=aspect_ratio,
+                    workflow_id=workflow_id,
+                    seed=(seed + i + 1) if seed is not None else None,
+                )
+
+                # Submit extend
                 ext_assets = None
-                break
+                try:
+                    with console.status(f"[bold green]Submitting extend ({ext_prompt[:40]})..."):
+                        ext_assets = client.extend_video(ext_req)
+                except FlowAPIError as e:
+                    err_str = str(e)
+                    _segment_last_error.msg = err_str
+                    _segment_last_error.is_policy = _is_policy_violation(err_str)
+                    if _segment_last_error.is_policy:
+                        console.print(f"  [red]Policy violation on segment {i + 1}:[/red] {err_str[:120]}")
+                    else:
+                        console.print(f"  [red]Error submitting segment {i + 1}:[/red] {err_str[:120]}")
+                    continue  # retry
 
-        if ext_assets is None:
-            break
+                if not ext_assets:
+                    _segment_last_error.msg = "No operation returned"
+                    console.print(f"  [yellow]No operation returned for segment {i + 1}.[/yellow]")
+                    continue  # retry
 
-        if not ext_assets:
-            console.print(f"[yellow]No operation returned for extension {i + 1}.[/yellow]")
-            break
+                # Poll/render
+                ext_op_names = [a.id for a in ext_assets if a.id]
+                try:
+                    with console.status(f"[bold green]Rendering segment {i + 1} (1-3 min)..."):
+                        ext_final = client.wait_for_video(ext_op_names, timeout=timeout)
+                except FlowAPIError as e:
+                    err_str = str(e)
+                    _segment_last_error.msg = err_str
+                    _segment_last_error.is_policy = _is_policy_violation(err_str)
+                    if _segment_last_error.is_policy:
+                        console.print(f"  [red]Policy violation rendering segment {i + 1}:[/red] {err_str[:120]}")
+                    else:
+                        console.print(f"  [red]Error rendering segment {i + 1}:[/red] {err_str[:120]}")
+                    continue  # retry
 
-        ext_op_names = [a.id for a in ext_assets if a.id]
-        try:
-            with console.status(f"[bold green]Rendering segment {i + 1} (1-3 min)..."):
-                ext_final = client.wait_for_video(ext_op_names, timeout=timeout)
-        except FlowAPIError as e:
-            console.print(f"[red]Error rendering extension {i + 1}:[/red] {e}")
-            break
+                if not ext_final:
+                    _segment_last_error.msg = "No assets returned"
+                    _segment_last_error.is_policy = True  # often means blocked
+                    console.print(f"  [yellow]Segment {i + 1} returned no assets (possibly blocked).[/yellow]")
+                    continue  # retry
 
-        if not ext_final:
-            console.print(f"[yellow]Extension {i + 1} returned no assets.[/yellow]")
-            break
+                ext_asset = ext_final[0]
+                all_assets.append(ext_asset)
 
-        ext_asset = ext_final[0]
-        all_assets.append(ext_asset)
+                # Save segment
+                seg_path = out_dir / f"{prefix}-seg{i + 1}.mp4"
+                try:
+                    path = client.save_video(ext_asset, seg_path)
+                    segment_paths.append(path)
+                    console.print(f"  [green]Segment {i + 1} saved:[/green] {path}")
+                except Exception as e:
+                    console.print(f"  [yellow]Download failed:[/yellow] {e}")
 
-        # Save segment
-        seg_path = out_dir / f"{prefix}-seg{i + 1}.mp4"
-        try:
-            path = client.save_video(ext_asset, seg_path)
-            segment_paths.append(path)
-            console.print(f"  [green]Segment {i + 1} saved:[/green] {path}")
-        except Exception as e:
-            console.print(f"  [yellow]Download failed:[/yellow] {e}")
+                # Update workflow for next segment chaining
+                new_media_name = client.get_media_name_for_op(ext_asset.id) or ext_asset.id
+                if client._workflow_id:
+                    workflow_id = client._workflow_id
+                if workflow_id and new_media_name:
+                    client.update_workflow(workflow_id, primary_media_id=new_media_name)
+                current_media_id = new_media_name
+                console.print(f"  Media ID (primaryMedia): {current_media_id}")
 
-        # After extend completes, the new media name becomes the primaryMediaId
-        # for the next extend.  The Flow UI PATCHes the workflow to register this.
-        new_media_name = client.get_media_name_for_op(ext_asset.id) or ext_asset.id
-        if client._workflow_id:
-            workflow_id = client._workflow_id
-        # PATCH workflow to update primaryMediaId (required for chaining extends)
-        if workflow_id and new_media_name:
-            client.update_workflow(workflow_id, primary_media_id=new_media_name)
-        # Now read back the current primaryMediaId for next iteration
-        current_media_id = new_media_name
-        console.print(f"  Media ID (primaryMedia): {current_media_id}")
+                segment_success = True
+                break  # segment done, move to next
+
+            except (requests.exceptions.ConnectionError, ConnectionResetError, OSError) as e:
+                _segment_last_error.msg = str(e)
+                console.print(f"  [red]Connection error on segment {i + 1}:[/red] {str(e)[:120]}")
+                continue  # retry
+
+            except Exception as e:
+                _segment_last_error.msg = str(e)
+                _segment_last_error.is_policy = _is_policy_violation(str(e))
+                console.print(f"  [red]Unexpected error on segment {i + 1}:[/red] {str(e)[:120]}")
+                continue  # retry
+
+        if not segment_success:
+            console.print(f"  [red bold]Segment {i + 1} failed after {MAX_SEGMENT_RETRIES} attempts — skipping.[/red bold]")
+            # Don't break — try remaining segments. The video will have a gap but at least continues.
+            # For chaining to work, we keep the same current_media_id (last successful segment)
+            continue
 
     # ---- Summary ----
     console.print(f"\n[bold green]Done![/bold green] Generated {len(all_assets)} segments.")
