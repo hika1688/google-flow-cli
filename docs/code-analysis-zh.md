@@ -227,3 +227,29 @@ CLI 只做“输入输出 + 调用编排”：
 - 这是一个围绕 Google Flow 的“可脚本化工程化封装”，核心难点是认证（cookie/token/recaptcha）与异步视频流程管理。
 - 代码在分层上较清晰：CLI 轻、业务层重、协议层独立。
 - 当前实现已具备较强实战可用性；后续建议主要集中在测试覆盖与错误可观测性提升。
+
+---
+
+## 12. 显式创建项目的使用方法
+
+新增命令：`gflow create-project`
+
+```bash
+# 使用默认标题创建项目
+gflow create-project
+
+# 指定项目标题
+gflow create-project --title "我的测试项目"
+
+# 输出 JSON（适合脚本/Agent）
+gflow create-project --title "批处理任务" --json
+```
+
+返回值示例（`--json`）：
+
+```json
+{
+  "project_id": "project-abc123",
+  "title": "批处理任务"
+}
+```

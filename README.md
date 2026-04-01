@@ -62,6 +62,19 @@ gflow list
 gflow download <asset-id> -o output.png
 ```
 
+If you want to create a Flow project explicitly before generation:
+
+```bash
+# Create with default title
+gflow create-project
+
+# Create with custom title
+gflow create-project --title "Demo Project"
+
+# JSON output for scripts/agents
+gflow create-project --title "Automation Run" --json
+```
+
 ## Setup: Discovering RPC IDs
 
 Google Flow uses the same BatchExecute protocol as NotebookLM, but with different RPC endpoint IDs. You need to discover these by inspecting network traffic:
