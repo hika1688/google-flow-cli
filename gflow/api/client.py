@@ -389,13 +389,19 @@ class FlowClient:
         if self._project_id:
             return self._project_id
 
+        return self.create_project()
+
+    def create_project(self, title: str = "Untitled project") -> str:
+        """Create a new Flow project and cache the resulting project ID."""
+        self._project_id = ""
+
         self._ensure_token()
 
         # Create a new project via trpc
         url = f"{LABS_BASE}/trpc/project.createProject"
         payload = {
             "json": {
-                "projectTitle": "Untitled project",
+                "projectTitle": title,
                 "toolName": TOOL_NAME,
             }
         }

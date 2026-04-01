@@ -135,6 +135,28 @@ def close_browser(ctx):
     console.print("[green]Chrome session closed.[/green]")
 
 
+@cli.command("create-project")
+@click.option("--title", default="Untitled project", help="Project title")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+@click.pass_context
+def create_project(ctx, title, as_json):
+    """Create a new Flow project explicitly and print the project ID."""
+    client = _get_client(ctx.obj["debug"])
+    try:
+        project_id = client.create_project(title=title)
+    except FlowAPIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        client.close()
+        sys.exit(1)
+
+    client.close()
+
+    if as_json:
+        click.echo(json.dumps({"project_id": project_id, "title": title}, indent=2))
+    else:
+        console.print(f"[green]Created project:[/green] {project_id}")
+
+
 # =============================================================
 # Image generation
 # =============================================================
