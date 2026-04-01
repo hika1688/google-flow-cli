@@ -90,6 +90,7 @@ gflow raw "xYz123" --args '["my prompt", "16:9"]'
 | `gflow auth` | Authenticate with Google Flow |
 | `gflow auth --status` | Check auth status |
 | `gflow auth --clear` | Clear saved credentials |
+| `gflow create-project` | Explicitly create a new Flow project |
 | `gflow generate-image PROMPT` | Generate images (Imagen 4) |
 | `gflow generate-video PROMPT` | Generate videos (Veo 3.1) |
 | `gflow list` | List assets in your library |

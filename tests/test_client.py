@@ -127,6 +127,35 @@ class TestClientInit:
         assert len(client._session_id) > 5
 
 
+class TestCreateProject:
+    """Test explicit project creation API."""
+
+    @patch.object(FlowClient, '_ensure_token')
+    def test_create_project_with_title(self, mock_token):
+        client = FlowClient(cookies="test")
+        client._labs_session = MagicMock()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "result": {
+                "data": {
+                    "json": {
+                        "result": {"projectId": "proj-xyz"},
+                    }
+                }
+            }
+        }
+        client._labs_session.post.return_value = mock_resp
+
+        project_id = client.create_project(title="My Project")
+
+        assert project_id == "proj-xyz"
+        call = client._labs_session.post.call_args
+        assert "project.createProject" in call[0][0]
+        assert call[1]["json"]["json"]["projectTitle"] == "My Project"
+
+
 class TestImagePayload:
     """Test that generate_image builds correct payload."""
 
